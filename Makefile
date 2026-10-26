@@ -91,12 +91,28 @@ clean:
 # Host-native unit tests (no cross-compile). humanize.c must stay free of
 # hardware headers behind HUMANIZE_HOSTTEST so it builds with system gcc.
 .PHONY: test
+TEST_BUILD_DIR ?= /tmp/hurra-v2-tests
 test:
-	cc -std=c11 -O2 -DHUMANIZE_HOSTTEST -Isrc -o /tmp/humanize_test \
+	@mkdir -p $(TEST_BUILD_DIR)
+	cc -std=c11 -O2 -DHUMANIZE_HOSTTEST -Isrc -o $(TEST_BUILD_DIR)/humanize_test \
 	   test/humanize_test.c src/humanize.c -lm
-	/tmp/humanize_test
-	cc -std=c11 -O2 -Isrc -o /tmp/motion_test \
+	$(TEST_BUILD_DIR)/humanize_test
+	cc -std=c11 -O2 -Isrc -o $(TEST_BUILD_DIR)/motion_test \
 	   test/motion_test.c src/actions.c -lm
-	/tmp/motion_test
-	cc -std=c11 -O2 -Isrc -o /tmp/synth_cadence_test test/synth_cadence_test.c
-	/tmp/synth_cadence_test
+	$(TEST_BUILD_DIR)/motion_test
+	cc -std=c11 -O2 -Isrc -o $(TEST_BUILD_DIR)/synth_cadence_test test/synth_cadence_test.c
+	$(TEST_BUILD_DIR)/synth_cadence_test
+
+# Independent reliability checks execute production parsers and mocked eDMA IO.
+.PHONY: test-reliability test-all
+test-reliability:
+	@mkdir -p $(TEST_BUILD_DIR)
+	cc -std=c11 -O1 -g -fsanitize=address,undefined -Isrc test/uart_buffers_test.c -o $(TEST_BUILD_DIR)/uart_buffers_test
+	$(TEST_BUILD_DIR)/uart_buffers_test
+	cc -std=c11 -O1 -g -fsanitize=address,undefined -DHUMANIZE_HOSTTEST -DTEST_FERRUM=1 -Itest/support -Isrc -Isrc/third_party/TinyFrame test/protocol_reliability_test.c src/actions.c src/humanize.c -lm -o $(TEST_BUILD_DIR)/ferrum_reliability_test
+	$(TEST_BUILD_DIR)/ferrum_reliability_test
+	cc -std=c11 -O1 -g -fsanitize=address,undefined -DHUMANIZE_HOSTTEST -DTEST_FERRUM=0 -Itest/support -Isrc -Isrc/third_party/TinyFrame test/protocol_reliability_test.c src/actions.c src/humanize.c src/third_party/TinyFrame/TinyFrame.c -lm -o $(TEST_BUILD_DIR)/hurra_reliability_test
+	$(TEST_BUILD_DIR)/hurra_reliability_test
+	python3 test/kmbox_rx_test.py
+
+test-all: test test-reliability

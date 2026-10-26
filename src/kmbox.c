@@ -10,6 +10,9 @@
 #include "actions.h"
 #include "gpt_profile.h"
 #include "synth_cadence.h"
+#include "uart_buffers.h"
+#include "time_utils.h"
+#include "TF_Config.h"
 #include <string.h>
 
 extern uint32_t millis(void);
@@ -70,7 +73,7 @@ static uint32_t link_last_rx_time;
 static uint32_t last_rx_activity_time;
 #define BAUD_IDLE_RESET_MS 5000
 
-// DMA RX major-loop ISR — fires every DMA_RX_RING_SIZE bytes. Just clears
+// DMA RX major-loop ISR — fires every UART_RX_MAJOR_COUNT bytes. Just clears
 // the channel-done flag; SEVONPEND propagates the NVIC-pending into a SEV
 // so the main loop's WFE wakes promptly on a burst of UART data instead
 // of waiting for the next PIT tick.
@@ -85,7 +88,7 @@ static void km_rx_dma_isr(void)
 
 // LPUART IDLE-line ISR — fires after one idle character at the end of each
 // CH343B USB-frame burst. Pairs with the DMA major-loop ISR to wake the
-// main loop's WFE between bursts (DMA only fires every DMA_RX_RING_SIZE
+// main loop's WFE between bursts (DMA only fires every UART_RX_MAJOR_COUNT
 // bytes, so without this the last partial burst would wait for the next
 // PIT tick). Body just W1C's the IDLE flag; SEVONPEND handles the wake.
 static void km_uart_idle_isr(void)
@@ -97,12 +100,18 @@ static void km_uart_idle_isr(void)
 // Ring sized to match CH343B's 1 KB USB IN buffer so a full burst lands in
 // one transfer. At 2 Mbaud (~200 KB/s) this is ~5 ms of headroom vs the
 // previous 256-byte ring's 1.3 ms.
-#define DMA_RX_RING_SIZE 1024
+#define DMA_RX_RING_SIZE UART_RX_RING_SIZE
 static uint8_t dma_rx_ring[DMA_RX_RING_SIZE]
 	__attribute__((section(".dmabuffers"), aligned(DMA_RX_RING_SIZE)));
-static volatile uint16_t rx_tail;
+static uint16_t rx_tail;
+static uart_rx_tracker_t rx_tracker;
+static uint32_t rx_loss_seen;
+static bool rx_sample_valid;
+static uint8_t rx_batch[256];
 
-#define TX_RING_SIZE 256
+#define TX_RING_SIZE 512
+// Current 1-byte payload length bounds each TinyFrame to one <=264-byte callback.
+_Static_assert(TX_RING_SIZE > TF_SENDBUF_LEN, "TX ring must admit a complete TinyFrame callback");
 static uint8_t tx_ring[TX_RING_SIZE];
 static uint16_t tx_head;
 static uint16_t tx_tail_pos;
@@ -182,21 +191,10 @@ static void apply_mouse_result(int16_t dx, int16_t dy, uint8_t buttons,
                                int8_t wheel);
 static void baud_change_apply(uint32_t baud);
 
-static void tx_enqueue(uint8_t b)
-{
-	uint16_t next = (tx_head + 1) & (TX_RING_SIZE - 1);
-	if (next == tx_tail_pos) {
-		tx_overflow_count++;
-		return;
-	}
-	tx_ring[tx_head] = b;
-	tx_head = next;
-}
-
 static void uart_tx_frame(const uint8_t *data, uint16_t len)
 {
-	for (uint16_t i = 0; i < len; i++)
-		tx_enqueue(data[i]);
+	if (!uart_tx_append(tx_ring, TX_RING_SIZE, &tx_head, tx_tail_pos, data, len))
+		tx_overflow_count += len;
 }
 
 static void tx_flush(void)
@@ -329,14 +327,14 @@ void kmbox_init(void)
 	KM_RX_SADDR = (volatile const void *)&KM_UART_DATA;
 	KM_RX_SOFF = 0;
 	KM_RX_ATTR = DMA_TCD_ATTR_SSIZE(DMA_TCD_ATTR_SIZE_8BIT) |
-	             DMA_TCD_ATTR_DSIZE(DMA_TCD_ATTR_SIZE_8BIT);
+	             DMA_TCD_ATTR_DSIZE(DMA_TCD_ATTR_SIZE_8BIT) | DMA_TCD_ATTR_DMOD(10);
 	KM_RX_NBYTES = 1;
 	KM_RX_SLAST = 0;
 	KM_RX_DADDR = (volatile void *)dma_rx_ring;
 	KM_RX_DOFF = 1;
-	KM_RX_CITER = DMA_RX_RING_SIZE;
-	KM_RX_BITER = DMA_RX_RING_SIZE;
-	KM_RX_DLASTSGA = -DMA_RX_RING_SIZE;
+	KM_RX_CITER = UART_RX_MAJOR_COUNT;
+	KM_RX_BITER = UART_RX_MAJOR_COUNT;
+	KM_RX_DLASTSGA = 0; // destination modulo wraps independently of the count
 	KM_RX_CSR = DMA_TCD_CSR_INTMAJOR;
 	KM_RX_DMAMUX = KM_RX_DMAMUX_SRC | DMAMUX_CHCFG_ENBL;
 	attachInterruptVector(IRQ_DMA_CH3, km_rx_dma_isr);
@@ -345,6 +343,8 @@ void kmbox_init(void)
 	DMA_SERQ = KM_RX_CH;
 	KM_UART_BAUD |= LPUART_BAUD_RDMAE;
 	rx_tail = 0;
+	uart_rx_tracker_init(&rx_tracker, millis());
+	rx_loss_seen = 0;
 	KM_TX_DMAMUX = 0;
 	KM_TX_SADDR = (volatile const void *)dma_tx_buf;
 	KM_TX_SOFF = 1;
@@ -601,20 +601,84 @@ void kmbox_cache_endpoints(const captured_descriptors_t *desc)
 
 }
 
+// No wrap inference from IRQs: CITER covers sixteen complete ring laps.
+// Reject incoherent register samples; long poll pauses fail closed even if a
+// coalesced interrupt or count reload would otherwise conceal received bytes.
+static uint32_t rx_available(void)
+{
+	for (unsigned retry = 0; retry < 3; retry++) {
+		uint32_t before_us = gpt_profile_us(), before_ms = millis();
+		uint16_t count = KM_RX_CITER;
+		uint16_t head = ((uintptr_t)KM_RX_DADDR - (uintptr_t)dma_rx_ring) & (DMA_RX_RING_SIZE - 1u);
+		bool empty = (KM_UART_WATER >> 24) == 0;
+		uint32_t after_us = gpt_profile_us(), after_ms = millis();
+		if (KM_RX_CITER != count) continue;
+		uint32_t delta = (rx_tracker.remaining - count) & UART_RX_COUNT_MASK;
+		if (((rx_tracker.produced + delta) & (DMA_RX_RING_SIZE - 1u)) != head) continue;
+		__asm volatile("dmb" ::: "memory");
+		uint32_t n = uart_rx_sample(&rx_tracker, count, head, after_us, after_ms, empty);
+		rx_tracker.sampled_us = before_us;
+		rx_tracker.sampled_ms = before_ms;
+		rx_tail = rx_tracker.consumed & (DMA_RX_RING_SIZE - 1u);
+		rx_sample_valid = true;
+		return n;
+	}
+	rx_sample_valid = false;
+	return 0;
+}
+
+static void rx_recover(void)
+{
+	if (rx_loss_seen == rx_tracker.losses) return;
+	rx_drv_overrun_count += rx_tracker.losses - rx_loss_seen;
+	rx_loss_seen = rx_tracker.losses;
+	proto_reset();
+	act_release_injected();
+	inject.click_release_mask = 0;
+	inject.click_release_at = 0;
+	inject.kb_release_count = 0;
+	humanize_cancel();
+	inject.mouse_wheel = 0;
+	inject.mouse_dx = inject.mouse_dy = 0;
+	GPIO1_DR_TOGGLE = STATUS_LED_BIT;
+}
+
 bool kmbox_rx_pending(void)
 {
-	uint16_t head = ((uint32_t)KM_RX_DADDR - (uint32_t)dma_rx_ring)
-	              & (DMA_RX_RING_SIZE - 1);
-	if (head != rx_tail) return true;
-	// Also gate heavy on a sticky LPUART error so it gets cleared. OR in
-	// particular halts hardware reception until cleared — leaving it set
-	// would lock UART forever (no bytes → rx_pending stays false → heavy
-	// never runs → OR never cleared).
-	return (KM_UART_STAT & (LPUART_STAT_OR | LPUART_STAT_FE | LPUART_STAT_NF)) != 0;
+	uint32_t available = rx_available();
+	rx_recover();
+	return available != 0 ||
+	       (KM_UART_STAT & (LPUART_STAT_OR | LPUART_STAT_FE | LPUART_STAT_NF)) != 0;
+}
+
+static void release_keys_due(uint32_t now)
+{
+	for (unsigned r = 0; r < inject.kb_release_count; ) {
+		if (time_reached(now, inject.kb_releases[r].at)) {
+			uint8_t key = inject.kb_releases[r].key;
+			act_kb_up(key); // clear authoritative state, including modifier keys
+			inject.kb_releases[r] = inject.kb_releases[--inject.kb_release_count];
+		} else {
+			r++;
+		}
+	}
+}
+
+static void apply_pending_baud(void)
+{
+	// DMA idle only means bytes reached the UART FIFO. Preserve the final ACK
+	// until both FIFO and shifter are empty before disabling TE/RE.
+	if (pending_baud_rate && tx_head == tx_tail_pos &&
+	    !(DMA_ERQ & (1u << KM_TX_CH)) && (KM_UART_STAT & LPUART_STAT_TC)) {
+		baud_change_apply(pending_baud_rate);
+		pending_baud_rate = 0;
+	}
 }
 
 void kmbox_poll_fast(void)
 {
+	(void)rx_available(); // keep the bounded DMA counter observable while idle
+	rx_recover();
 	merged_this_cycle = false;
 
 	// Call tx_flush when there's data to drain (ring non-empty), when
@@ -641,12 +705,7 @@ void kmbox_poll_fast(void)
 	// after the first poll it stays 0 until another TX *completes*. Instead
 	// check DMA_ERQ (auto-cleared on transfer completion with DREQ) plus
 	// software ring empty.
-	if (__builtin_expect(pending_baud_rate != 0, 0) &&
-	    tx_head == tx_tail_pos &&
-	    !(DMA_ERQ & (1u << KM_TX_CH))) {
-		baud_change_apply(pending_baud_rate);
-		pending_baud_rate = 0;
-	}
+	apply_pending_baud();
 
 	// Drive catch_xy deadline check even when no UART RX is arriving.
 	proto_tick();
@@ -656,31 +715,14 @@ void kmbox_poll_fast(void)
 	// path, so it composes with real-mouse passthrough and humanization.
 	act_motion_tick();
 
-	if (__builtin_expect(inject.click_release_at != 0, 0) && millis() >= inject.click_release_at) {
+	if (__builtin_expect(inject.click_release_mask != 0, 0) && time_reached(millis(), inject.click_release_at)) {
 		inject.mouse_buttons &= ~inject.click_release_mask;
 		inject.mouse_dirty = true;
 		inject.click_release_mask = 0;
 		inject.click_release_at = 0;
 	}
 
-	if (__builtin_expect(inject.kb_release_count, 0)) {
-		uint32_t now = millis();
-		for (int r = 0; r < inject.kb_release_count; ) {
-			if (now >= inject.kb_releases[r].at) {
-				uint8_t key = inject.kb_releases[r].key;
-				for (int i = 0; i < 6; i++) {
-					if (inject.kb_keys[i] == key) {
-						inject.kb_keys[i] = 0;
-						break;
-					}
-				}
-				inject.kb_dirty = true;
-				inject.kb_releases[r] = inject.kb_releases[--inject.kb_release_count];
-			} else {
-				r++;
-			}
-		}
-	}
+	if (__builtin_expect(inject.kb_release_count, 0)) release_keys_due(millis());
 
 	// LINK-LED timeout lives in _fast (not _heavy) — _heavy stops being
 	// called once the ring drains, so the LED would stick on otherwise.
@@ -701,52 +743,43 @@ void kmbox_poll_heavy(void)
 		if (stat & LPUART_STAT_FE) uart_framing_count++;
 		if (stat & LPUART_STAT_NF) uart_noise_count++;
 		KM_UART_STAT = stat & (LPUART_STAT_OR | LPUART_STAT_FE | LPUART_STAT_NF);
-		if (stat & (LPUART_STAT_OR | LPUART_STAT_FE)) {
-			proto_reset();
+		if (stat & (LPUART_STAT_OR | LPUART_STAT_FE | LPUART_STAT_NF)) {
+			rx_tracker.losses++;
+			rx_tracker.recovering = true;
+			rx_tracker.progress_us = gpt_profile_us();
+			rx_recover();
 		}
 		GPIO1_DR_TOGGLE = STATUS_LED_BIT;
 	}
 
-	uint16_t head = ((uint32_t)KM_RX_DADDR - (uint32_t)dma_rx_ring) & (DMA_RX_RING_SIZE - 1);
-	if (head != rx_tail) {
-		GPIO3_DR_TOGGLE = LINK_LED_BIT;
-		link_last_rx_time = millis();
-		last_rx_activity_time = link_last_rx_time;
+	uint32_t count = rx_available();
+	rx_recover();
+	if (count > sizeof(rx_batch)) count = sizeof(rx_batch);
+	if (!count) return;
+	uint32_t consumed = rx_tracker.consumed;
+	uint32_t losses = rx_tracker.losses;
+	uint16_t pos = consumed & (DMA_RX_RING_SIZE - 1u);
+	uint32_t first = DMA_RX_RING_SIZE - pos;
+	if (first > count) first = count;
+	memcpy(rx_batch, dma_rx_ring + pos, first);
+	if (count > first) memcpy(rx_batch + first, dma_rx_ring, count - first);
+	__asm volatile("dmb" ::: "memory");
+	(void)rx_available();
+	if (!rx_sample_valid || rx_tracker.losses != losses || rx_tracker.recovering ||
+	    rx_tracker.consumed != consumed) {
+		rx_recover();
+		return; // never parse bytes crossed by a DMA overwrite
 	}
-
-	// Driver-overrun heuristic: if the HW write pointer has run >=3/4 of the
-	// ring ahead of the SW read pointer, bytes were almost certainly lost (the
-	// eDMA ring wraps silently). Count it, snap rp to wp to skip the stale
-	// span, and reset the parser so the next valid frame realigns cleanly.
-	{
-		uint16_t gap = (uint16_t)((head - rx_tail) & (DMA_RX_RING_SIZE - 1));
-		if (__builtin_expect(gap > (DMA_RX_RING_SIZE * 3u / 4u), 0)) {
-			rx_drv_overrun_count++;
-			rx_tail = head;
-			proto_reset();
-			GPIO1_DR_TOGGLE = STATUS_LED_BIT;
-		}
-	}
-
-	if (rx_tail != head) {
-		// Feed the whole burst in <=2 contiguous spans (batch TF_Accept).
-		uint16_t count = (uint16_t)((head - rx_tail) & (DMA_RX_RING_SIZE - 1));
-		if (head > rx_tail) {
-			proto_feed(&dma_rx_ring[rx_tail], (uint16_t)(head - rx_tail));
-		} else {
-			proto_feed(&dma_rx_ring[rx_tail],
-			           (uint16_t)(DMA_RX_RING_SIZE - rx_tail));
-			if (head) proto_feed(&dma_rx_ring[0], head);
-		}
-		rx_bytes_total += count;
-		frames_ok++;                       // counts RX bursts processed
-		GPIO3_DR_TOGGLE = STATE_LED_BIT;
-		rx_tail = head;
-		// Immediate reply flush: any reply/telemetry the parser queued during
-		// the feed leaves in one DMA TX on this same poll, instead of waiting
-		// for the next poll_fast tick. Protocol-agnostic latency win.
-		tx_flush();
-	}
+	rx_tracker.consumed += count;
+	rx_tail = rx_tracker.consumed & (DMA_RX_RING_SIZE - 1u);
+	GPIO3_DR_TOGGLE = LINK_LED_BIT;
+	link_last_rx_time = millis();
+	last_rx_activity_time = link_last_rx_time;
+	proto_feed(rx_batch, (uint16_t)count);
+	rx_bytes_total += count;
+	frames_ok++;
+	GPIO3_DR_TOGGLE = STATE_LED_BIT;
+	tx_flush();
 }
 
 __attribute__((cold, noinline))
@@ -1209,6 +1242,8 @@ uint32_t kmbox_uart_framing(void) { return uart_framing_count; }
 uint32_t kmbox_uart_noise(void) { return uart_noise_count; }
 uint32_t kmbox_tx_overflow(void) { return tx_overflow_count; }
 uint32_t kmbox_rx_drv_overrun(void) { return rx_drv_overrun_count; }
+uint32_t kmbox_rx_discarded(void) { return rx_tracker.discarded; }
+uint32_t kmbox_rx_ambiguous(void) { return rx_tracker.ambiguous; }
 
 uint16_t kmbox_tx_room(void)
 {
@@ -1263,5 +1298,8 @@ void kmbox_schedule_kb_release(uint8_t key, uint32_t delay_ms)
 		inject.kb_releases[inject.kb_release_count].key = key;
 		inject.kb_releases[inject.kb_release_count].at = at;
 		inject.kb_release_count++;
+	} else {
+		// A press that cannot be scheduled must not become an indefinite hold.
+		act_kb_up(key);
 	}
 }
