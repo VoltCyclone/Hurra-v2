@@ -3,6 +3,7 @@
 #include "actions.h"
 #include "kmbox.h"
 #include <string.h>
+#include <limits.h>
 
 extern uint32_t millis(void);
 
@@ -67,6 +68,18 @@ void act_init(void)
 	g_masked_count = 0;
 }
 
+// Link-loss recovery clears only injected activity, retaining configured masks.
+void act_release_injected(void)
+{
+	g_buttons = 0;
+	g_kb_modifier = 0;
+	memset(g_kb_keys, 0, sizeof(g_kb_keys));
+	memset(&g_click_sched, 0, sizeof(g_click_sched));
+	g_motion.kind = MOTION_NONE;
+	kmbox_inject_mouse(0, 0, 0, 0);
+	kmbox_inject_keyboard(0, g_kb_keys);
+}
+
 int8_t act_button_set(uint8_t mask, uint8_t action)
 {
 	if (action == 0) {
@@ -100,16 +113,24 @@ void act_click(uint8_t button_1based, uint8_t count, uint32_t delay_ms)
 	}
 }
 
+// Position telemetry has a finite signed range; saturate rather than invoke UB.
+static int32_t position_add(int32_t value, int16_t delta)
+{
+	if (delta > 0 && value > INT32_MAX - delta) return INT32_MAX;
+	if (delta < 0 && value < INT32_MIN - delta) return INT32_MIN;
+	return value + delta;
+}
+
 // Core mover: applies swap/invert transforms and injects. Shared by the public
 // act_move and the motion-program tick. Does NOT cancel the motion program, so
 // the tick can drive it without self-aborting.
 static void act_move_raw(int16_t dx, int16_t dy)
 {
 	if (s_swap_xy)  { int16_t t = dx; dx = dy; dy = t; }
-	if (s_invert_x) dx = (int16_t)-dx;
-	if (s_invert_y) dy = (int16_t)-dy;
-	g_pos_x += dx;
-	g_pos_y += dy;
+	if (s_invert_x) dx = dx == INT16_MIN ? INT16_MAX : (int16_t)-dx;
+	if (s_invert_y) dy = dy == INT16_MIN ? INT16_MAX : (int16_t)-dy;
+	g_pos_x = position_add(g_pos_x, dx);
+	g_pos_y = position_add(g_pos_y, dy);
 	kmbox_inject_mouse(dx, dy, g_buttons, 0);
 }
 
@@ -125,12 +146,13 @@ int8_t act_kb_down(uint8_t key)
 	if (key >= 0xE0 && key <= 0xE7) {
 		g_kb_modifier |= (1u << (key - 0xE0));
 	} else {
-		bool added = false;
+		int empty = -1;
 		for (int i = 0; i < 6; i++) {
-			if (g_kb_keys[i] == key) { added = true; break; }
-			if (g_kb_keys[i] == 0) { g_kb_keys[i] = key; added = true; break; }
+			if (g_kb_keys[i] == key) return 0;
+			if (g_kb_keys[i] == 0 && empty < 0) empty = i;
 		}
-		if (!added) return -1;
+		if (empty < 0) return -1;
+		g_kb_keys[empty] = key;
 	}
 	kmbox_inject_keyboard(g_kb_modifier, g_kb_keys);
 	return 0;
@@ -150,16 +172,7 @@ void act_kb_up(uint8_t key)
 
 void act_kb_press(uint8_t key, uint32_t delay_ms)
 {
-	if (key >= 0xE0 && key <= 0xE7) {
-		g_kb_modifier |= (1u << (key - 0xE0));
-	} else {
-		for (int i = 0; i < 6; i++) {
-			if (g_kb_keys[i] == key) break;
-			if (g_kb_keys[i] == 0) { g_kb_keys[i] = key; break; }
-		}
-	}
-	kmbox_inject_keyboard(g_kb_modifier, g_kb_keys);
-	kmbox_schedule_kb_release(key, delay_ms);
+	if (act_kb_down(key) == 0) kmbox_schedule_kb_release(key, delay_ms);
 }
 
 uint8_t act_kb_isdown(uint8_t key)

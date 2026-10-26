@@ -33,6 +33,8 @@ uint32_t kmbox_uart_framing(void);  // FE: baud mismatch / signal
 uint32_t kmbox_uart_noise(void);    // NF: electrical noise
 uint32_t kmbox_tx_overflow(void);   // bytes dropped when tx_ring was full
 uint32_t kmbox_rx_drv_overrun(void);
+uint32_t kmbox_rx_discarded(void); // lower bound if ambiguous is nonzero
+uint32_t kmbox_rx_ambiguous(void);
 uint16_t kmbox_tx_room(void);
 void     kmbox_set_baud(uint32_t baud);
 uint32_t kmbox_current_baud(void);
