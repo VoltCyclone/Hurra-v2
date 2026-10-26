@@ -272,6 +272,11 @@ void humanize_return(int16_t dx, int16_t dy) {
     S.owed_y += (float)dy;
 }
 
+void humanize_cancel(void) {
+    S.owed_x = S.owed_y = S.res_x = S.res_y = 0.0f;
+    S.n_perp = 0.0f;
+}
+
 HZ_FASTRUN
 bool humanize_pending(void) {
     return fabsf(S.owed_x) >= HZ_IDLE_EPS || fabsf(S.owed_y) >= HZ_IDLE_EPS ||

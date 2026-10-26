@@ -5,6 +5,7 @@
 #include "actions.h"
 #include "humanize.h"
 #include "kmbox.h"
+#include "time_utils.h"
 #include "imxrt.h"
 #include <string.h>
 
@@ -72,6 +73,7 @@ enum {
 
 // ── TinyFrame instance ──────────────────────────────────────────────────────
 static TinyFrame s_tf;
+static uint32_t s_tick_ms;
 static hurra_tx_fn s_tx;
 
 void TF_WriteImpl(TinyFrame *tf, const uint8_t *buf, uint32_t len)
@@ -94,8 +96,10 @@ static bool     s_have_last_id;
 
 // ── deferred actions ─────────────────────────────────────────────────────────
 static uint32_t s_reboot_at;
+static bool s_reboot_scheduled;
 static uint32_t s_baud_pending;
 static uint32_t s_baud_apply_at;
+static bool s_baud_scheduled;
 
 // ── callback state (Ferrum-standard on-change callbacks) ────────────────────
 static uint8_t  s_cb_buttons, s_cb_axes, s_cb_keys;
@@ -550,6 +554,7 @@ static TF_Result l_reboot(TinyFrame *tf, TF_Msg *msg)
     uint8_t ok = 0;
     send_reply(msg, &ok, 1);
     s_reboot_at = millis() + 20;
+    s_reboot_scheduled = true;
     return TF_STAY;
 }
 
@@ -570,6 +575,7 @@ static TF_Result l_baud(TinyFrame *tf, TF_Msg *msg)
     send_reply(msg, ack, 4);
     s_baud_pending  = new_baud;
     s_baud_apply_at = millis() + 20;
+    s_baud_scheduled = true;
     return TF_STAY;
 }
 
@@ -633,6 +639,7 @@ static void tlm_send(uint8_t type, const uint8_t *p, uint16_t n)
 // ── public API ──────────────────────────────────────────────────────────────
 void hurra_init(void)
 {
+    s_tick_ms = millis();
     memset(&s_tf, 0, sizeof(s_tf));
     TF_InitStatic(&s_tf, TF_MASTER);
     s_tx = NULL;
@@ -642,8 +649,10 @@ void hurra_init(void)
     s_tx_ring_skip = 0;
     s_have_last_id = false;
     s_reboot_at = 0;
+    s_reboot_scheduled = false;
     s_baud_pending = 0;
     s_baud_apply_at = 0;
+    s_baud_scheduled = false;
     s_cb_buttons = s_cb_axes = s_cb_keys = 0;
     s_cb_phys = 0;
     memset(s_last_keys_emitted, 0, sizeof(s_last_keys_emitted));
@@ -700,9 +709,15 @@ void hurra_feed(const uint8_t *buf, uint16_t len) { TF_Accept(&s_tf, buf, (uint3
 void hurra_tick(void)
 {
     uint32_t now = millis();
-    TF_Tick(&s_tf);
+    uint32_t ticks = now - s_tick_ms;
+    if (ticks) {
+        s_tick_ms = now;
+        // No ID timeout listeners are installed; parser timeout saturates at 5.
+        if (ticks > TF_PARSER_TIMEOUT_TICKS) ticks = TF_PARSER_TIMEOUT_TICKS;
+        while (ticks--) TF_Tick(&s_tf);
+    }
 
-    if (s_catch.active && now >= s_catch.deadline) {
+    if (s_catch.active && time_reached(now, s_catch.deadline)) {
         uint8_t p[8];
         memcpy(&p[0], &s_catch.accum_x, 4);
         memcpy(&p[4], &s_catch.accum_y, 4);
@@ -715,11 +730,12 @@ void hurra_tick(void)
         TF_Respond(&s_tf, &r);
         s_catch.active = false;
     }
-    if (s_baud_apply_at && now >= s_baud_apply_at) {
+    if (s_baud_scheduled && time_reached(now, s_baud_apply_at)) {
         kmbox_set_baud(s_baud_pending);
         s_baud_apply_at = 0;
+        s_baud_scheduled = false;
     }
-    if (s_reboot_at && now >= s_reboot_at) {
+    if (s_reboot_scheduled && time_reached(now, s_reboot_at)) {
         SCB_AIRCR = 0x05FA0004;  // ARM SYSRESETREQ (macro from imxrt.h)
     }
 }

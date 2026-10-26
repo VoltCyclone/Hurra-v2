@@ -15,6 +15,7 @@
 #include "actions.h"
 #include "humanize.h"
 #include "kmbox.h"
+#include "time_utils.h"
 #include <string.h>
 
 extern uint32_t millis(void);
@@ -92,7 +93,7 @@ static bool parse_int(const char *s, uint8_t len, int32_t *out)
 	}
 	if (neg) {
 		if (u > 0x80000000u) return false;
-		*out = -(int32_t)u;
+		*out = u == 0x80000000u ? INT32_MIN : -(int32_t)u;
 	} else {
 		if (u > 0x7FFFFFFFu) return false;
 		*out = (int32_t)u;
@@ -535,7 +536,7 @@ void ferrum_tick(void)
 	// independent of UART RX activity.  Without this, a host that calls
 	// km.catch_xy(dur) and then idles would never see the reply.
 	if (__builtin_expect(!s_catch.active, 1)) return;
-	if (millis() < s_catch.deadline) return;
+	if (!time_reached(millis(), s_catch.deadline)) return;
 	emit_catch_result();
 	s_catch.active = false;
 }
@@ -547,7 +548,7 @@ void ferrum_feed_byte(uint8_t b)
 	// catch_xy: emit result when timer expires.  Belt-and-braces — also
 	// covered by ferrum_tick() from the poll loop, but checking here lets
 	// us emit immediately when the host pokes us with new bytes.
-	if (__builtin_expect(s_catch.active, 0) && now >= s_catch.deadline) {
+	if (__builtin_expect(s_catch.active, 0) && time_reached(now, s_catch.deadline)) {
 		emit_catch_result();
 		s_catch.active = false;
 	}

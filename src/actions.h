@@ -12,6 +12,7 @@ extern uint8_t  g_kb_keys[6];
 extern int32_t  g_pos_x, g_pos_y;
 
 void    act_init(void);
+void    act_release_injected(void);
 int8_t  act_button_set(uint8_t mask, uint8_t action);    // action: 0=up, 1=down
 void    act_click(uint8_t button_1based, uint8_t count, uint32_t delay_ms);
 void    act_click_tick(void);            // step scheduled click sequences from poll loop

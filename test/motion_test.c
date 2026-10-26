@@ -135,6 +135,16 @@ int main(void) {
     CHECK(releases == 3, "multiclick: three button-up injections");
     CHECK((g_last_buttons & 0x01) == 0, "multiclick: button released after sequence");
 
+    // Click releases remain scheduled across the millisecond counter wrap.
+    g_ms = UINT32_MAX - 4;
+    act_click(1, 1, 10);
+    act_click_tick();
+    CHECK(g_last_buttons & 1, "wrapped click: held before deadline");
+    g_ms = 4; act_click_tick();
+    CHECK(g_last_buttons & 1, "wrapped click: held one tick before deadline");
+    g_ms = 5; act_click_tick();
+    CHECK(!(g_last_buttons & 1), "wrapped click: released at deadline");
+
     if (failures == 0) printf("\nALL PASSED\n");
     else               printf("\n%d FAILURE(S)\n", failures);
     return failures ? 1 : 0;
