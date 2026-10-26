@@ -43,7 +43,7 @@ static void *KM_RX_DADDR;
 static uint32_t KM_UART_WATER, KM_UART_STAT, GPIO1_DR_TOGGLE, GPIO3_DR_TOGGLE;
 static uint32_t uart_overrun_count, uart_framing_count, uart_noise_count, rx_drv_overrun_count;
 static uint32_t rx_bytes_total, frames_ok, link_last_rx_time, last_rx_activity_time;
-static struct {uint8_t click_release_mask, kb_release_count; uint32_t click_release_at;
+static struct {uint8_t kb_release_count;
                int16_t mouse_dx, mouse_dy; int8_t mouse_wheel;
                struct {uint8_t key; uint32_t at;} kb_releases[6];} inject;
 static uint32_t us, ms, produced, delivered, resets, releases, cancellations;

@@ -21,6 +21,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi
 
+      - name: Host regression tests
+        run: make test test-reliability
+
+      - name: Build Ferrum firmware
+        run: make PROTOCOL=ferrum TOOLCHAIN=/usr/bin && make clean PROTOCOL=ferrum
+
       - name: Build firmware
         run: make TOOLCHAIN=/usr/bin
 

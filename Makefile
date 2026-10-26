@@ -2,6 +2,7 @@ TOOLCHAIN = /Users/ramseymcgrath/.platformio/packages/toolchain-gccarmnoneeabi-t
 CC      = $(TOOLCHAIN)/arm-none-eabi-gcc
 OBJCOPY = $(TOOLCHAIN)/arm-none-eabi-objcopy
 SIZE    = $(TOOLCHAIN)/arm-none-eabi-size
+HOST_CC ?= cc
 
 TARGET = firmware
 
@@ -39,20 +40,23 @@ DEFINES = -DARDUINO_TEENSY_MICROMOD -D__IMXRT1062__ -DF_CPU=$(F_CPU) \
           -DCMD_BAUD=$(CMD_BAUD) $(PROTO_DEF)
 
 CFLAGS = $(MCU_FLAGS) $(DEFINES) \
-         -Os -Wall -Wno-unused-variable \
+         -Os -Wall \
          -ffunction-sections -fdata-sections \
          -flto -fsingle-precision-constant \
-         -Iinclude -Isrc -Isrc/third_party/TinyFrame
+         -Iinclude -Isrc -Isrc/third_party/TinyFrame \
+         -MD -MP
 
 LDFLAGS = $(MCU_FLAGS) \
           -Tcore/imxrt1062_mm.ld \
           -Wl,--gc-sections \
+          -Wl,-Map=$(TARGET).map \
+          -Wl,--print-memory-usage \
           -flto -fuse-linker-plugin \
           --specs=nano.specs --specs=nosys.specs
 
 CORE_SRC = core/startup.c core/bootdata.c
 SRC = src/main.c src/usb_host.c src/usb_device.c src/desc_capture.c \
-      src/kmbox.c src/humanize.c src/actions.c src/led.c \
+      src/kmbox.c src/humanize.c src/actions.c src/led.c src/kb_layout.c \
       $(PROTO_SRC)
 
 OBJ = $(CORE_SRC:.c=.o) $(SRC:.c=.o)
@@ -75,7 +79,7 @@ ifeq ($(PROTOCOL),hurra)
 else
   HOT_SRC += src/ferrum.o
 endif
-$(HOT_SRC): CFLAGS := $(subst -Os,-O2,$(CFLAGS)) -ffast-math
+$(HOT_SRC): CFLAGS := $(patsubst -O%,,$(CFLAGS)) -O2 -ffast-math
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -84,9 +88,10 @@ flash: $(TARGET).hex
 	teensy_loader_cli --mcu=TEENSY_MICROMOD -w -v $(TARGET).hex
 
 clean:
-	rm -f $(OBJ) $(TARGET).elf $(TARGET).hex
+	rm -f $(OBJ) $(OBJ:.o=.d) $(TARGET).elf $(TARGET).hex $(TARGET).map
+	rm -f /tmp/humanize_test /tmp/motion_test /tmp/synth_cadence_test
 
-.PHONY: all flash clean
+.PHONY: all flash clean test test-all
 
 # Host-native unit tests (no cross-compile). humanize.c must stay free of
 # hardware headers behind HUMANIZE_HOSTTEST so it builds with system gcc.
@@ -94,25 +99,32 @@ clean:
 TEST_BUILD_DIR ?= /tmp/hurra-v2-tests
 test:
 	@mkdir -p $(TEST_BUILD_DIR)
-	cc -std=c11 -O2 -DHUMANIZE_HOSTTEST -Isrc -o $(TEST_BUILD_DIR)/humanize_test \
+	$(HOST_CC) -std=c11 -O2 -DHUMANIZE_HOSTTEST -Isrc -o $(TEST_BUILD_DIR)/humanize_test \
 	   test/humanize_test.c src/humanize.c -lm
 	$(TEST_BUILD_DIR)/humanize_test
-	cc -std=c11 -O2 -Isrc -o $(TEST_BUILD_DIR)/motion_test \
+	$(HOST_CC) -std=c11 -O2 -Isrc -o $(TEST_BUILD_DIR)/motion_test \
 	   test/motion_test.c src/actions.c -lm
 	$(TEST_BUILD_DIR)/motion_test
-	cc -std=c11 -O2 -Isrc -o $(TEST_BUILD_DIR)/synth_cadence_test test/synth_cadence_test.c
+	$(HOST_CC) -std=c11 -O2 -Isrc -o $(TEST_BUILD_DIR)/kb_layout_test test/kb_layout_test.c src/kb_layout.c
+	$(TEST_BUILD_DIR)/kb_layout_test
+	$(HOST_CC) -std=c11 -O2 -Isrc -o $(TEST_BUILD_DIR)/synth_cadence_test test/synth_cadence_test.c
 	$(TEST_BUILD_DIR)/synth_cadence_test
 
 # Independent reliability checks execute production parsers and mocked eDMA IO.
 .PHONY: test-reliability test-all
 test-reliability:
 	@mkdir -p $(TEST_BUILD_DIR)
-	cc -std=c11 -O1 -g -fsanitize=address,undefined -Isrc test/uart_buffers_test.c -o $(TEST_BUILD_DIR)/uart_buffers_test
+	$(HOST_CC) -std=c11 -O1 -g -fsanitize=address,undefined -Isrc test/uart_buffers_test.c -o $(TEST_BUILD_DIR)/uart_buffers_test
 	$(TEST_BUILD_DIR)/uart_buffers_test
-	cc -std=c11 -O1 -g -fsanitize=address,undefined -DHUMANIZE_HOSTTEST -DTEST_FERRUM=1 -Itest/support -Isrc -Isrc/third_party/TinyFrame test/protocol_reliability_test.c src/actions.c src/humanize.c -lm -o $(TEST_BUILD_DIR)/ferrum_reliability_test
+	$(HOST_CC) -std=c11 -O1 -g -fsanitize=address,undefined -DHUMANIZE_HOSTTEST -DTEST_FERRUM=1 -Itest/support -Isrc -Isrc/third_party/TinyFrame test/protocol_reliability_test.c src/actions.c src/humanize.c -lm -o $(TEST_BUILD_DIR)/ferrum_reliability_test
 	$(TEST_BUILD_DIR)/ferrum_reliability_test
-	cc -std=c11 -O1 -g -fsanitize=address,undefined -DHUMANIZE_HOSTTEST -DTEST_FERRUM=0 -Itest/support -Isrc -Isrc/third_party/TinyFrame test/protocol_reliability_test.c src/actions.c src/humanize.c src/third_party/TinyFrame/TinyFrame.c -lm -o $(TEST_BUILD_DIR)/hurra_reliability_test
+	$(HOST_CC) -std=c11 -O1 -g -fsanitize=address,undefined -DHUMANIZE_HOSTTEST -DTEST_FERRUM=0 -Itest/support -Isrc -Isrc/third_party/TinyFrame test/protocol_reliability_test.c src/actions.c src/humanize.c src/third_party/TinyFrame/TinyFrame.c -lm -o $(TEST_BUILD_DIR)/hurra_reliability_test
 	$(TEST_BUILD_DIR)/hurra_reliability_test
 	python3 test/kmbox_rx_test.py
 
 test-all: test test-reliability
+	$(MAKE) clean && $(MAKE) PROTOCOL=hurra
+	$(MAKE) clean && $(MAKE) PROTOCOL=ferrum
+
+# Rebuild objects when their headers change.
+-include $(OBJ:.o=.d)

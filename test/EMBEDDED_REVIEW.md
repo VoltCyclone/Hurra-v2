@@ -13,7 +13,7 @@ This review targets the single-core i.MX RT1062 implementation on main. The RP23
 | Position arithmetic | Saturates cumulative position and minimum signed inversion instead of overflowing. |
 | DMA cache ownership | Existing non-cacheable OCRAM DMA section, alignment, MPU mapping and linker size assertion are already appropriate; retained. |
 | Core 1, RP hardware spinlocks, TFT ISR rendering | Not applicable to this single-core implementation. |
-| USB descriptors/report IDs/halt recovery; click scheduler | Existing open PR #9 addresses these independently. Main still needs that PR; this branch does not replace it. |
+| USB descriptors/report IDs/halt recovery; click scheduler | PR #9 addresses these independently. Preserved while reconciling PR #9 with the reliability fixes. |
 
 ## RX guarantee and recovery limits
 
@@ -23,8 +23,8 @@ A prolonged polling gap fails closed: data and parser state are discarded, injec
 
 ## Validation
 
-`make test-all` passes existing motion/humanization/cadence tests and new AddressSanitizer/UndefinedBehaviorSanitizer tests for both protocol implementations and UART helpers. The kmbox adapter compiles extracted production routines against register mocks and tests complete/multiple laps, incoherent snapshots, overwrite during copying, idle recovery, timed modifier release, and UART TC gating.
+`make test test-reliability` runs existing motion/humanization/cadence tests and new AddressSanitizer/UndefinedBehaviorSanitizer tests for both protocol implementations and UART helpers. The kmbox adapter compiles extracted production routines against register mocks and tests complete/multiple laps, incoherent snapshots, overwrite during copying, idle recovery, timed modifier release, and UART TC gating.
 
 `make PROTOCOL=hurra` and `make PROTOCOL=ferrum` cannot link locally: the configured arm-none-eabi-gcc installation is absent. PR CI provides the full firmware build. No physical board, DMA/cache stress, USB enumeration or signal/baud validation was performed. TinyFrame emits an existing harmless uint8 length-versus-256 comparison warning in the host suite.
 
-PR #9 also changes actions.c, kmbox.c, protocol and Makefile tests; reconcile its click scheduler/lock changes with these independent changes when merging. The pre-existing 912 MHz overclock (rated maximum 600 MHz) is unchanged and remains a hardware stability/lifetime risk.
+`make test-all` additionally builds both firmware protocols. PR #9 integration retains the click scheduler and removes stale legacy release fields; click deadlines now handle timer rollover. The pre-existing 912 MHz overclock (rated maximum 600 MHz) is unchanged and remains a hardware stability/lifetime risk.
